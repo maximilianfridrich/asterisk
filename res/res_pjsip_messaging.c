@@ -136,6 +136,9 @@ const pjsip_method pjsip_message_method = {PJSIP_OTHER_METHOD, {"MESSAGE", 7} };
 #define MAX_HDR_SIZE 512
 #define MAX_BODY_SIZE 1024
 #define MAX_USER_SIZE 128
+#define MAX_REDIRECT_HOPS 5
+#define MAX_URI_SIZE 512
+#define MAX_REDIRECT_CONTACTS 20
 
 static struct ast_taskprocessor *message_serializer;
 
@@ -580,6 +583,285 @@ static struct msg_data *msg_data_create(const struct ast_msg *msg, const char *d
 	return mdata;
 }
 
+/*!
+ * \internal
+ * \brief Visited URI tracking for redirect loop detection
+ */
+struct visited_uri {
+	char uri[MAX_URI_SIZE];
+	AST_LIST_ENTRY(visited_uri) list;
+};
+
+/*!
+ * \internal
+ * \brief Redirect contact with q-value for prioritization
+ */
+struct redirect_contact {
+	char uri[PJSIP_MAX_URL_SIZE];
+	float q_value; /* q-value from Contact header, default 1.0 if not present */
+	AST_LIST_ENTRY(redirect_contact) list;
+};
+
+/*! \brief List of redirect contacts */
+AST_LIST_HEAD_NOLOCK(redirect_contact_list, redirect_contact);
+
+/*!
+ * \internal
+ * \brief Callback data for MESSAGE response handling
+ */
+struct message_response_data {
+	struct ast_sip_endpoint *endpoint;
+	char *from;
+	char *to;
+	char *body;
+	char *content_type;
+	int hop_count;
+	AST_LIST_HEAD_NOLOCK(, visited_uri) visited_uris;
+	struct redirect_contact_list pending_contacts;
+};
+
+static void message_response_data_destroy(void *obj)
+{
+	struct message_response_data *resp_data = obj;
+	struct visited_uri *visited;
+	struct redirect_contact *contact;
+
+	ao2_cleanup(resp_data->endpoint);
+	ast_free(resp_data->from);
+	ast_free(resp_data->to);
+	ast_free(resp_data->body);
+	ast_free(resp_data->content_type);
+
+	while ((visited = AST_LIST_REMOVE_HEAD(&resp_data->visited_uris, list))) {
+		ast_free(visited);
+	}
+
+	while ((contact = AST_LIST_REMOVE_HEAD(&resp_data->pending_contacts, list))) {
+		ast_free(contact);
+	}
+}
+
+static struct message_response_data *message_response_data_create(
+	struct ast_sip_endpoint *endpoint,
+	const char *from,
+	const char *to,
+	const char *body,
+	const char *content_type,
+	const char *initial_uri)
+{
+	struct message_response_data *resp_data;
+	struct visited_uri *visited;
+
+	resp_data = ao2_alloc(sizeof(*resp_data), message_response_data_destroy);
+	if (!resp_data) {
+		return NULL;
+	}
+
+	resp_data->endpoint = ao2_bump(endpoint);
+	resp_data->from = ast_strdup(from);
+	resp_data->to = ast_strdup(to);
+	resp_data->body = ast_strdup(body);
+	resp_data->content_type = ast_strdup(content_type);
+	resp_data->hop_count = 0;
+	AST_LIST_HEAD_INIT_NOLOCK(&resp_data->visited_uris);
+	AST_LIST_HEAD_INIT_NOLOCK(&resp_data->pending_contacts);
+
+	/* Check for allocation failures */
+	if (!resp_data->from || !resp_data->to || !resp_data->body || !resp_data->content_type) {
+		ast_log(LOG_ERROR, "Failed to allocate memory for response data strings\n");
+		ao2_ref(resp_data, -1);
+		return NULL;
+	}
+
+	/* Add the initial URI to visited list */
+	if (initial_uri) {
+		visited = ast_calloc(1, sizeof(*visited));
+		if (visited) {
+			ast_copy_string(visited->uri, initial_uri, sizeof(visited->uri));
+			AST_LIST_INSERT_HEAD(&resp_data->visited_uris, visited, list);
+		} else {
+			ast_log(LOG_WARNING, "Failed to allocate initial visited URI - redirect loop detection may be impaired\n");
+		}
+	}
+
+	return resp_data;
+}
+
+/*!
+ * \internal
+ * \brief Check if a URI has already been visited (loop detection)
+ */
+static int is_uri_visited(struct message_response_data *resp_data, const char *uri)
+{
+	struct visited_uri *visited;
+
+	AST_LIST_TRAVERSE(&resp_data->visited_uris, visited, list) {
+		if (!strcmp(visited->uri, uri)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*!
+ * \internal
+ * \brief Add a URI to the visited list
+ */
+static int add_visited_uri(struct message_response_data *resp_data, const char *uri)
+{
+	struct visited_uri *visited;
+
+	visited = ast_calloc(1, sizeof(*visited));
+	if (!visited) {
+		return -1;
+	}
+
+	ast_copy_string(visited->uri, uri, sizeof(visited->uri));
+	AST_LIST_INSERT_TAIL(&resp_data->visited_uris, visited, list);
+
+	return 0;
+}
+
+/*!
+ * \internal
+ * \brief Extract q-value from a Contact header
+ *
+ * \param contact The Contact header
+ * \return The q-value (default 1.0 if not present or invalid)
+ */
+static float extract_q_value(pjsip_contact_hdr *contact)
+{
+	pjsip_param *param;
+	static const pj_str_t Q_STR = { "q", 1 };
+
+	/* Search for q parameter in the contact header */
+	param = pjsip_param_find(&contact->other_param, &Q_STR);
+	if (!param) {
+		/* No q parameter, use default */
+		return 1.0f;
+	}
+
+	/* Parse the q value */
+	if (param->value.slen > 0) {
+		char q_buf[16];
+		char *endptr;
+		float q_val;
+		int len = param->value.slen < sizeof(q_buf) - 1 ? param->value.slen : sizeof(q_buf) - 1;
+
+		memcpy(q_buf, param->value.ptr, len);
+		q_buf[len] = '\0';
+
+		errno = 0;
+		q_val = strtof(q_buf, &endptr);
+		if (errno == 0 && endptr != q_buf && q_val >= 0.0f && q_val <= 1.0f) {
+			return q_val;
+		}
+	}
+
+	/* Invalid q value, use default */
+	return 1.0f;
+}
+
+/*!
+ * \internal
+ * \brief Insert a contact into the sorted list by q-value (highest first)
+ *
+ * \param list The list to insert into
+ * \param new_contact The contact to insert
+ */
+static void insert_contact_sorted(struct redirect_contact_list *list,
+	struct redirect_contact *new_contact)
+{
+	struct redirect_contact *contact;
+
+	/* Find the insertion point - contacts with higher q values come first */
+	AST_LIST_TRAVERSE_SAFE_BEGIN(list, contact, list) {
+		if (new_contact->q_value > contact->q_value) {
+			/* Insert before this contact */
+			AST_LIST_INSERT_BEFORE_CURRENT(new_contact, list);
+			return;
+		}
+	}
+	AST_LIST_TRAVERSE_SAFE_END;
+
+	/* If we get here, insert at the end */
+	AST_LIST_INSERT_TAIL(list, new_contact, list);
+}
+
+/*!
+ * \internal
+ * \brief Parse all Contact headers from a 3xx response and create a sorted list
+ *
+ * \param rdata The redirect response data
+ * \param contacts List to populate with parsed contacts
+ * \return Number of valid contacts found
+ */
+static int parse_redirect_contacts(pjsip_rx_data *rdata,
+	struct redirect_contact_list *contacts)
+{
+	pjsip_contact_hdr *contact_hdr;
+	pjsip_uri *contact_uri;
+	int count = 0;
+	void *start = NULL;
+
+	/* Iterate through all Contact headers */
+	while ((contact_hdr = (pjsip_contact_hdr *)pjsip_msg_find_hdr(rdata->msg_info.msg,
+			PJSIP_H_CONTACT, start))) {
+		struct redirect_contact *redirect_contact;
+		int len;
+
+		start = contact_hdr->next;
+
+		/* Enforce maximum contact limit to prevent resource exhaustion */
+		if (count >= MAX_REDIRECT_CONTACTS) {
+			ast_log(LOG_WARNING, "MESSAGE redirect: maximum Contact header limit (%d) reached, ignoring additional contacts\n",
+				MAX_REDIRECT_CONTACTS);
+			break;
+		}
+
+		if (!contact_hdr->uri) {
+			continue;
+		}
+
+		contact_uri = (pjsip_uri *)pjsip_uri_get_uri(contact_hdr->uri);
+
+		/* Verify it's a SIP URI */
+		if (!PJSIP_URI_SCHEME_IS_SIP(contact_uri) && !PJSIP_URI_SCHEME_IS_SIPS(contact_uri)) {
+			ast_debug(1, "Skipping non-SIP/SIPS Contact URI in redirect\n");
+			continue;
+		}
+
+		/* Allocate a new redirect_contact structure */
+		redirect_contact = ast_calloc(1, sizeof(*redirect_contact));
+		if (!redirect_contact) {
+			ast_log(LOG_ERROR, "Failed to allocate memory for redirect contact\n");
+			continue;
+		}
+
+		/* Print the URI */
+		len = pjsip_uri_print(PJSIP_URI_IN_REQ_URI, contact_uri,
+			redirect_contact->uri, sizeof(redirect_contact->uri) - 1);
+		if (len < 1) {
+			ast_debug(1, "Contact URI too long, skipping\n");
+			ast_free(redirect_contact);
+			continue;
+		}
+		redirect_contact->uri[len] = '\0';
+
+		/* Extract q-value */
+		redirect_contact->q_value = extract_q_value(contact_hdr);
+
+		ast_debug(1, "Found redirect Contact: %s (q=%f)\n",
+			redirect_contact->uri, redirect_contact->q_value);
+
+		/* Insert into sorted list */
+		insert_contact_sorted(contacts, redirect_contact);
+		count++;
+	}
+
+	return count;
+}
+
 static void update_content_type(pjsip_tx_data *tdata, struct ast_msg *msg, struct ast_sip_body *body)
 {
 	static const pj_str_t CONTENT_TYPE = { "Content-Type", sizeof("Content-Type") - 1 };
@@ -609,6 +891,294 @@ static void update_content_type(pjsip_tx_data *tdata, struct ast_msg *msg, struc
 	}
 }
 
+/* Forward declaration for callback */
+static void msg_response_callback(void *token, pjsip_event *e);
+
+/*!
+ * \internal
+ * \brief Send a MESSAGE to a redirect target
+ *
+ * \param resp_data Response data containing endpoint and message info
+ * \param target_uri The URI to send the message to
+ *
+ * \return 0: success, -1: failure
+ */
+static int send_message_to_uri(struct message_response_data *resp_data, const char *target_uri)
+{
+	pjsip_tx_data *tdata;
+	struct visited_uri *visited;
+	struct message_response_data *new_resp_data;
+	struct ast_sip_body body = {
+		.type = "text",
+		.subtype = "plain",
+		.body_text = resp_data->body
+	};
+
+	ast_debug(1, "Sending redirected MESSAGE to '%s' (hop %d)\n",
+		target_uri, resp_data->hop_count + 1);
+
+	if (ast_sip_create_request("MESSAGE", NULL, resp_data->endpoint, target_uri, NULL, &tdata)) {
+		ast_log(LOG_WARNING, "PJSIP MESSAGE - Could not create redirect request\n");
+		return -1;
+	}
+
+	/* Update To header if we have one */
+	if (!ast_strlen_zero(resp_data->to)) {
+		ast_sip_update_to_uri(tdata, resp_data->to);
+	}
+
+	/* Update From header if we have one */
+	if (!ast_strlen_zero(resp_data->from)) {
+		ast_sip_update_from(tdata, resp_data->from);
+	}
+
+	/* Parse and set content type if provided */
+	if (!ast_strlen_zero(resp_data->content_type)) {
+		char *type_copy = ast_strdupa(resp_data->content_type);
+		char *subtype = strchr(type_copy, '/');
+		if (subtype) {
+			*subtype = '\0';
+			subtype++;
+			body.type = type_copy;
+			body.subtype = subtype;
+		}
+	}
+	ast_sip_add_body(tdata, &body);
+	if (!tdata->msg->body) {
+		pjsip_tx_data_dec_ref(tdata);
+		ast_log(LOG_ERROR, "PJSIP MESSAGE - Could not add body to redirect request\n");
+		return -1;
+	}
+
+	/* Increment hop count for the new request */
+	resp_data->hop_count++;
+
+	/* Create new callback data for potential further redirects */
+	new_resp_data = ao2_alloc(sizeof(*new_resp_data), message_response_data_destroy);
+	if (!new_resp_data) {
+		pjsip_tx_data_dec_ref(tdata);
+		ast_log(LOG_ERROR, "PJSIP MESSAGE - Could not allocate redirect callback data\n");
+		return -1;
+	}
+
+	/* Copy data from original response data */
+	new_resp_data->endpoint = ao2_bump(resp_data->endpoint);
+	new_resp_data->from = ast_strdup(resp_data->from);
+	new_resp_data->to = ast_strdup(resp_data->to);
+	new_resp_data->body = ast_strdup(resp_data->body);
+	new_resp_data->content_type = ast_strdup(resp_data->content_type);
+	new_resp_data->hop_count = resp_data->hop_count;
+	AST_LIST_HEAD_INIT_NOLOCK(&new_resp_data->visited_uris);
+
+	/* Check for allocation failures */
+	if (!new_resp_data->from || !new_resp_data->to || !new_resp_data->body || !new_resp_data->content_type) {
+		pjsip_tx_data_dec_ref(tdata);
+		ao2_ref(new_resp_data, -1);
+		ast_log(LOG_ERROR, "PJSIP MESSAGE - Failed to allocate memory for redirect callback strings\n");
+		return -1;
+	}
+
+	/* Copy visited URIs list */
+	AST_LIST_TRAVERSE(&resp_data->visited_uris, visited, list) {
+		if (add_visited_uri(new_resp_data, visited->uri)) {
+			pjsip_tx_data_dec_ref(tdata);
+			ao2_ref(new_resp_data, -1);
+			ast_log(LOG_ERROR, "PJSIP MESSAGE - Failed to allocate memory for visited URI copy\n");
+			return -1;
+		}
+	}
+
+	/* Add the new target URI to visited list */
+	if (add_visited_uri(new_resp_data, target_uri)) {
+		pjsip_tx_data_dec_ref(tdata);
+		ao2_ref(new_resp_data, -1);
+		ast_log(LOG_ERROR, "PJSIP MESSAGE - Failed to allocate memory for visited URI\n");
+		return -1;
+	}
+
+	/* Copy pending contacts list */
+	{
+		struct redirect_contact *contact;
+		AST_LIST_TRAVERSE(&resp_data->pending_contacts, contact, list) {
+			struct redirect_contact *new_contact = ast_calloc(1, sizeof(*new_contact));
+			if (!new_contact) {
+				/* Memory allocation failed - clean up and fail */
+				pjsip_tx_data_dec_ref(tdata);
+				ao2_ref(new_resp_data, -1);
+				ast_log(LOG_ERROR, "PJSIP MESSAGE - Failed to allocate memory for redirect contact copy\n");
+				return -1;
+			}
+			ast_copy_string(new_contact->uri, contact->uri, sizeof(new_contact->uri));
+			new_contact->q_value = contact->q_value;
+			AST_LIST_INSERT_TAIL(&new_resp_data->pending_contacts, new_contact, list);
+		}
+	}
+
+	/* Send with callback for potential further redirects */
+	if (ast_sip_send_request(tdata, NULL, resp_data->endpoint, new_resp_data, msg_response_callback)) {
+		ao2_ref(new_resp_data, -1);
+		ast_log(LOG_ERROR, "PJSIP MESSAGE - Could not send redirect request\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+/*!
+ * \internal
+ * \brief Handle a 3xx redirect response to a MESSAGE
+ *
+ * \param resp_data Response callback data
+ * \param rdata The redirect response data
+ */
+static void handle_message_redirect(struct message_response_data *resp_data, pjsip_rx_data *rdata)
+{
+	struct redirect_contact_list redirect_contacts;
+	struct redirect_contact *contact;
+	int status_code = rdata->msg_info.msg->line.status.code;
+	int contact_count;
+
+	ast_debug(1, "Received %d redirect response for MESSAGE\n", status_code);
+
+	/* Check redirect_method on endpoint */
+	if (resp_data->endpoint->redirect_method != AST_SIP_REDIRECT_URI_PJSIP) {
+		ast_log(LOG_NOTICE, "MESSAGE received %d redirect, but redirect_method is not 'uri_pjsip' (it is '%s'). Not following redirect.\n",
+			status_code,
+			resp_data->endpoint->redirect_method == AST_SIP_REDIRECT_USER ? "user" :
+			resp_data->endpoint->redirect_method == AST_SIP_REDIRECT_URI_CORE ? "uri_core" : "unknown");
+		return;
+	}
+
+	/* Check hop limit */
+	if (resp_data->hop_count >= MAX_REDIRECT_HOPS) {
+		ast_log(LOG_WARNING, "MESSAGE redirect hop limit (%d) reached. Not following redirect.\n",
+			MAX_REDIRECT_HOPS);
+		return;
+	}
+
+	/* Parse all Contact headers and sort by q-value */
+	AST_LIST_HEAD_INIT_NOLOCK(&redirect_contacts);
+	contact_count = parse_redirect_contacts(rdata, &redirect_contacts);
+
+	if (contact_count == 0) {
+		ast_log(LOG_WARNING, "MESSAGE received %d redirect without valid Contact headers. Cannot follow redirect.\n",
+			status_code);
+		return;
+	}
+
+	ast_log(LOG_NOTICE, "MESSAGE redirect: found %d Contact header%s\n",
+		contact_count, contact_count == 1 ? "" : "s");
+
+	/* Filter out contacts that would create loops */
+	AST_LIST_TRAVERSE_SAFE_BEGIN(&redirect_contacts, contact, list) {
+		if (is_uri_visited(resp_data, contact->uri)) {
+			ast_log(LOG_WARNING, "MESSAGE redirect: skipping Contact '%s' (would create loop)\n",
+				contact->uri);
+			AST_LIST_REMOVE_CURRENT(list);
+			ast_free(contact);
+			contact_count--;
+		}
+	}
+	AST_LIST_TRAVERSE_SAFE_END;
+
+	if (contact_count == 0) {
+		ast_log(LOG_WARNING, "MESSAGE redirect: all Contact URIs would create loops. Not following redirect.\n");
+		return;
+	}
+
+	/* Remove the first contact to try */
+	contact = AST_LIST_REMOVE_HEAD(&redirect_contacts, list);
+	if (!contact) {
+		ast_log(LOG_ERROR, "MESSAGE redirect: unexpected empty contact list\n");
+		return;
+	}
+
+	ast_log(LOG_NOTICE, "Following MESSAGE redirect to '%s' (q=%f, hop %d/%d, %d alternate%s remaining)\n",
+		contact->uri, contact->q_value, resp_data->hop_count + 1, MAX_REDIRECT_HOPS,
+		contact_count - 1, contact_count == 2 ? "" : "s");
+
+	/* Store remaining contacts for potential retry on non-2xx response */
+	{
+		struct redirect_contact *remaining;
+		while ((remaining = AST_LIST_REMOVE_HEAD(&redirect_contacts, list))) {
+			AST_LIST_INSERT_TAIL(&resp_data->pending_contacts, remaining, list);
+		}
+	}
+
+	/* Try the first contact */
+	send_message_to_uri(resp_data, contact->uri);
+	ast_free(contact);
+}
+
+/*!
+ * \internal
+ * \brief Callback for MESSAGE responses
+ *
+ * \param token Callback data
+ * \param e The pjsip event
+ */
+static void msg_response_callback(void *token, pjsip_event *e)
+{
+	struct message_response_data *resp_data = token;
+	pjsip_rx_data *rdata;
+	int status_code;
+
+	if (!resp_data) {
+		return;
+	}
+
+	/* Check event type */
+	if (e->body.tsx_state.type == PJSIP_EVENT_TIMER) {
+		ast_debug(1, "MESSAGE request timed out\n");
+		/* Try next pending contact if available */
+		if (!AST_LIST_EMPTY(&resp_data->pending_contacts)) {
+			struct redirect_contact *next_contact;
+			next_contact = AST_LIST_REMOVE_HEAD(&resp_data->pending_contacts, list);
+			if (next_contact) {
+				ast_log(LOG_NOTICE, "MESSAGE timed out, trying next Contact: '%s' (q=%f)\n",
+					next_contact->uri, next_contact->q_value);
+				send_message_to_uri(resp_data, next_contact->uri);
+				ast_free(next_contact);
+			}
+		}
+		ao2_ref(resp_data, -1);
+		return;
+	}
+
+	if (e->body.tsx_state.type != PJSIP_EVENT_RX_MSG) {
+		ast_debug(3, "MESSAGE response event type %d (not RX_MSG)\n", e->body.tsx_state.type);
+		ao2_ref(resp_data, -1);
+		return;
+	}
+
+	rdata = e->body.tsx_state.src.rdata;
+	status_code = e->body.tsx_state.tsx->status_code;
+
+	ast_debug(3, "Received MESSAGE response: %d\n", status_code);
+
+	/* Handle 3xx redirects */
+	if (status_code >= 300 && status_code < 400) {
+		handle_message_redirect(resp_data, rdata);
+	}
+	/* If non-2xx response and we have pending contacts, try the next one */
+	else if (status_code >= 400 && !AST_LIST_EMPTY(&resp_data->pending_contacts)) {
+		struct redirect_contact *next_contact;
+		next_contact = AST_LIST_REMOVE_HEAD(&resp_data->pending_contacts, list);
+		if (next_contact) {
+			ast_log(LOG_NOTICE, "MESSAGE to redirect target failed (%d), trying next Contact: '%s' (q=%f)\n",
+				status_code, next_contact->uri, next_contact->q_value);
+			send_message_to_uri(resp_data, next_contact->uri);
+			ast_free(next_contact);
+		}
+	}
+	/* Success (2xx) - don't try other contacts */
+	else if (status_code >= 200 && status_code < 300) {
+		ast_debug(1, "MESSAGE successfully delivered (%d)\n", status_code);
+	}
+
+	ao2_ref(resp_data, -1);
+}
+
 /*!
  * \internal
  * \brief Send a MESSAGE
@@ -631,6 +1201,11 @@ static void update_content_type(pjsip_tx_data *tdata, struct ast_msg *msg, struc
 static int msg_send(void *data)
 {
 	struct msg_data *mdata = data; /* The caller holds a reference */
+	/* Callback data for redirect handling */
+	struct message_response_data *resp_data;
+	char content_type_buf[128];
+	const char *from_uri;
+	const char *to_uri;
 
 	struct ast_sip_body body = {
 		.type = "text",
@@ -736,7 +1311,8 @@ static int msg_send(void *data)
 
 	update_content_type(tdata, mdata->msg, &body);
 
-	if (ast_sip_add_body(tdata, &body)) {
+	ast_sip_add_body(tdata, &body);
+	if (!tdata->msg->body) {
 		pjsip_tx_data_dec_ref(tdata);
 		ast_log(LOG_ERROR, "PJSIP MESSAGE - Could not add body to request\n");
 		return -1;
@@ -751,7 +1327,38 @@ static int msg_send(void *data)
 	ast_debug(1, "Sending message to '%s' (via endpoint %s) from '%s'\n",
 		uri, ast_sorcery_object_get_id(endpoint), mdata->from);
 
-	if (ast_sip_send_request(tdata, NULL, endpoint, NULL, NULL)) {
+	/* Determine From URI */
+	if (!ast_strlen_zero(mdata->from)) {
+		from_uri = mdata->from;
+	} else if (!ast_strlen_zero(ast_msg_get_from(mdata->msg))) {
+		from_uri = ast_msg_get_from(mdata->msg);
+	} else {
+		from_uri = "";
+	}
+
+	/* Determine To URI */
+	if (!ast_strlen_zero(ast_msg_get_to(mdata->msg))) {
+		to_uri = ast_msg_get_to(mdata->msg);
+	} else {
+		to_uri = "";
+	}
+
+	/* Build content type string */
+	snprintf(content_type_buf, sizeof(content_type_buf), "%s/%s", body.type, body.subtype);
+
+	/* Create callback data */
+	resp_data = message_response_data_create(endpoint, from_uri, to_uri,
+		body.body_text, content_type_buf, uri);
+
+	if (!resp_data) {
+		pjsip_tx_data_dec_ref(tdata);
+		ast_log(LOG_ERROR, "PJSIP MESSAGE - Could not allocate callback data\n");
+		return -1;
+	}
+
+	/* Send with callback for redirect handling */
+	if (ast_sip_send_request(tdata, NULL, endpoint, resp_data, msg_response_callback)) {
+		ao2_ref(resp_data, -1);
 		ast_log(LOG_ERROR, "PJSIP MESSAGE - Could not send request\n");
 		return -1;
 	}
